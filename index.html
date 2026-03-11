@@ -1,0 +1,711 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PRIMORDIUM</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Courier+Prime&display=swap');
+*,*::before,*::after{margin:0;padding:0;box-sizing:border-box}
+body{background:#000;width:100vw;height:100vh;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:'Courier Prime','Courier New',monospace}
+#wrap{position:relative;width:min(72vw,72vh);height:min(72vw,72vh);flex-shrink:0}
+canvas#gl{width:100%;height:100%;display:block;border-radius:50%}
+#scope-ring{position:absolute;inset:-8px;border-radius:50%;pointer-events:none;z-index:1;border:5px solid #181818;box-shadow:0 0 24px 6px rgba(0,0,0,.9),inset 0 0 10px rgba(60,60,60,.25)}
+#viewport-overlay{position:absolute;inset:0;pointer-events:none;border-radius:50%;box-shadow:inset 0 0 50px 25px rgba(180,180,180,.07),inset 0 0 100px 50px rgba(160,160,160,.04),0 0 0 9999px #000;z-index:2}
+#feather{position:absolute;inset:-2px;border-radius:50%;pointer-events:none;z-index:3;box-shadow:inset 0 0 18px 10px rgba(0,0,0,.75),inset 0 0 40px 20px rgba(0,0,0,.45),inset 0 0 70px 35px rgba(0,0,0,.2);border:2px solid #1a1a1a}
+#glare{position:absolute;inset:0;border-radius:50%;pointer-events:none;z-index:4;background:radial-gradient(ellipse 25% 18% at 32% 22%,rgba(255,255,255,.05) 0%,transparent 100%)}
+#input-area{margin-top:18px;z-index:10;display:flex;align-items:center;justify-content:center}
+#input-wrapper{position:relative;display:inline-block}
+#colored-overlay{position:absolute;pointer-events:none;font-family:'Courier Prime','Courier New',monospace;font-size:36px;letter-spacing:3px;padding:8px 16px;white-space:pre;text-align:center;width:80vw;max-width:80vw;z-index:11;background:transparent;overflow:hidden;line-height:1.3}
+#rna-input{font-family:'Courier Prime','Courier New',monospace;font-size:36px;letter-spacing:3px;text-transform:uppercase;text-align:center;width:80vw;max-width:80vw;padding:8px 16px;background:#0a0a0a;border:1px solid #555;border-radius:4px;color:transparent;outline:none;caret-color:#888;line-height:1.3;display:flex;align-items:center}
+#rna-input::placeholder{color:#444;text-transform:none;letter-spacing:0}
+#rna-input:focus{border-color:#555;box-shadow:none}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <canvas id="gl"></canvas>
+  <div id="scope-ring"></div>
+  <div id="viewport-overlay"></div>
+  <div id="feather"></div>
+  <div id="glare"></div>
+</div>
+<div id="input-area">
+  <div id="input-wrapper">
+    <div id="colored-overlay"></div>
+    <input id="rna-input" type="text" maxlength="50" spellcheck="false" autocomplete="off"/>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+const canvas = document.getElementById('gl');
+const gl = canvas.getContext('webgl2', { antialias: false });
+if (!gl) { document.body.innerHTML = '<p style="color:#f44;padding:40vh 2em;text-align:center">WebGL 2 is required.</p>'; throw 'no gl'; }
+
+gl.getExtension('EXT_color_buffer_float');
+const extFLin = gl.getExtension('OES_texture_float_linear');
+const floatFilter = extFLin ? gl.LINEAR : gl.NEAREST;
+
+const SIM = 256;
+canvas.width = SIM;
+canvas.height = SIM;
+
+const DEFAULT_SEQ = 'GGCAGGGCAGCGCAGUCGGACAUUGAUAACGGAAUCGAGCCCGCC';
+
+// ===================== GL Utilities =====================
+function compileShader(src, type) {
+  const s = gl.createShader(type);
+  gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+    console.error('Shader error:\n' + gl.getShaderInfoLog(s)); gl.deleteShader(s); return null;
+  }
+  return s;
+}
+function linkProg(vsSrc, fsSrc, label) {
+  const vs = compileShader(vsSrc, gl.VERTEX_SHADER);
+  const fs = compileShader(fsSrc, gl.FRAGMENT_SHADER);
+  if (!vs || !fs) { console.error('Compile fail: ' + label); return null; }
+  const p = gl.createProgram();
+  gl.attachShader(p, vs); gl.attachShader(p, fs); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) { console.error('Link fail (' + label + '):', gl.getProgramInfoLog(p)); return null; }
+  return p;
+}
+
+const qVao = gl.createVertexArray();
+gl.bindVertexArray(qVao);
+const qBuf = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, qBuf);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1,1,-1,-1,1,1,1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0,2,gl.FLOAT,false,0,0);
+gl.bindVertexArray(null);
+function quad(){ gl.bindVertexArray(qVao); gl.drawArrays(gl.TRIANGLE_STRIP,0,4); gl.bindVertexArray(null); }
+
+function ppFBO() {
+  function mk(){
+    const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIM,SIM,0,gl.RGBA,gl.FLOAT,null);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER, floatFilter);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER, floatFilter);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S, gl.REPEAT);
+    gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T, gl.REPEAT);
+    const f = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, f);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    return {fbo:f, tex:t};
+  }
+  const a=mk(), b=mk();
+  return { r:a, w:b, swap(){ const t=this.r; this.r=this.w; this.w=t; } };
+}
+
+const A = ppFBO(), B = ppFBO(), C = ppFBO();
+
+function cpuTex(){
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA32F,SIM,SIM,0,gl.RGBA,gl.FLOAT,null);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER, floatFilter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER, floatFilter);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T, gl.REPEAT);
+  return t;
+}
+const stampTex = cpuTex();
+const colorTex = cpuTex();  // per-organism cell color (dominant base)
+const pulseTex = cpuTex();  // per-organism inner pulse color
+const ringTex  = cpuTex();  // per-organism ring color (secondary base)
+let stampBuf = new Float32Array(SIM*SIM*4);
+let colorBuf = new Float32Array(SIM*SIM*4);
+let pulseBuf = new Float32Array(SIM*SIM*4);
+let ringBuf  = new Float32Array(SIM*SIM*4);
+
+// ===================== Shaders =====================
+const VS = `#version 300 es
+layout(location=0)in vec2 p;
+out vec2 uv;
+void main(){uv=p*.5+.5;gl_Position=vec4(p,0,1);}`;
+
+// ---------- BUFFER A: SmoothLife ----------
+const FS_A = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 O;
+uniform sampler2D uSelf, uStamp;
+uniform float uRes;
+uniform int uFrame;
+
+const float PI=3.14159265, dt=0.30;
+const float Ro=7.0, Ri=2.5;
+const float b1=0.257,b2=0.336,d1=0.365,d2=0.549;
+const float aN=0.028,aM=0.147;
+
+#define MOD3 vec3(.1031,.11369,.13787)
+float hash13(vec3 q){q=fract(q*MOD3);q+=dot(q,q.yzx+19.19);return fract((q.x+q.y)*q.z);}
+float sa(float x,float a,float b){return 1./(1.+exp(-(x-a)*4./b));}
+float sab(float x,float a,float b,float e){return sa(x,a,e)*(1.-sa(x,b,e));}
+float tf(vec2 dr){float s1=sab(dr.x,b1,b2,aN),s2=sab(dr.x,d1,d2,aN);return s1*(1.-sa(dr.y,.5,aM))+s2*sa(dr.y,.5,aM);}
+float rs(float sp,float t){return clamp(t-sp+.5,0.,1.);}
+
+void main(){
+  ivec2 fc=ivec2(uv*uRes);
+  vec3 col=texelFetch(uSelf,fc,0).xyz;
+  vec2 acc=vec2(0.0);
+  int iRo=int(Ro);
+  for(int dx=-iRo;dx<=iRo;dx++){
+    for(int dy=-iRo;dy<=iRo;dy++){
+      float dist=length(vec2(float(dx),float(dy)));
+      ivec2 sp=ivec2(mod(vec2(fc)+vec2(float(dx),float(dy)),vec2(uRes)));
+      float w=texelFetch(uSelf,sp,0).x;
+      acc.x+=w*rs(Ri,dist)*(1.-rs(Ro,dist));
+      acc.y+=w*(1.-rs(Ri,dist));
+    }
+  }
+  vec2 area=PI*vec2(Ro*Ro,Ri*Ri); area.x-=area.y;
+  vec2 nc=acc/area;
+  float dfdt=dt*(2.*tf(nc)-1.);
+  col.x+=dfdt; col.yz=nc; col=clamp(col,0.,1.);
+  if(uFrame<10){
+    float h=hash13(vec3(vec2(fc),float(uFrame)));
+    float sv=texelFetch(uStamp,fc,0).x;
+    col=vec3(h-sv+0.5);
+  }
+  float sv=texelFetch(uStamp,fc,0).x;
+  if(sv>0.01) col.x=max(col.x,sv);
+  O=vec4(col,dfdt);
+}`;
+
+// ---------- BUFFER B: Exterior wave ----------
+const FS_B = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 O;
+uniform sampler2D uSelf, uLife;
+uniform float uRes;
+float lk(ivec2 p){return texelFetch(uSelf,ivec2(mod(vec2(p),vec2(uRes))),0).r;}
+void main(){
+  ivec2 p=ivec2(uv*uRes);
+  float c=lk(p);
+  float lap=(lk(p+ivec2(0,-1))+lk(p+ivec2(0,1))+lk(p+ivec2(-1,0))+lk(p+ivec2(1,0)))/4.-c;
+  vec4 prev=texelFetch(uSelf,p,0);
+  float f=prev.r, df=prev.g;
+  df+=1.5*lap; f+=df; f*=0.98;
+  float life=abs(texelFetch(uLife,p,0).x);
+  df+=life*.07;
+  if(life>.96){float b=smoothstep(0.,1.,1.-life);df*=b;f*=b;}
+  O=vec4(f,df,lap,1.);
+}`;
+
+// ---------- BUFFER C: Interior wave ----------
+const FS_C = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 O;
+uniform sampler2D uSelf, uLife;
+uniform float uRes;
+const int lapR=3, lifeR=3;
+const float wspd=0.1;
+vec3 lk(ivec2 p){return texelFetch(uSelf,ivec2(mod(vec2(p),vec2(uRes))),0).rgb;}
+vec3 lkl(ivec2 p){return texelFetch(uLife,ivec2(mod(vec2(p),vec2(uRes))),0).rgb;}
+void main(){
+  ivec2 p=ivec2(uv*uRes);
+  vec4 prev=texelFetch(uSelf,p,0);
+  float f=prev.r, df=prev.g;
+  vec3 sum=vec3(0); float tw=0.;
+  for(int dx=-lapR;dx<=lapR;dx++)for(int dy=-lapR;dy<=lapR;dy++){sum+=lk(p+ivec2(dx,dy));tw+=1.;}
+  float ddf=-lk(p).r+sum.r/tw;
+  vec3 sumL=vec3(0); float twL=0.;
+  for(int dx=-lifeR;dx<=lifeR;dx++)for(int dy=-lifeR;dy<=lifeR;dy++){sumL+=lkl(p+ivec2(dx,dy));twL+=1.;}
+  float life=abs(sumL.r/twL);
+  df+=1.5*ddf; f+=df*wspd;
+  float nl=1.-life, dlife=life-prev.a;
+  df-=dlife;
+  if(nl>.95){float b=smoothstep(0.,1.,1.-nl);df*=b;f*=b;}
+  O=vec4(f,df,ddf,life);
+}`;
+
+// ---------- IMAGE: Final composite ----------
+// Per-organism bright colors from dominant/secondary nucleotides
+// Styled after iteration 3's vivid look but with RNA-driven color variation
+const FS_IMG = `#version 300 es
+precision highp float;
+in vec2 uv;
+out vec4 O;
+uniform sampler2D uA,uB,uC,uCol,uPulse,uRing;
+uniform float uRes;
+
+// Defaults match iteration 3: neutral gray cell, teal ring
+const vec3 DefaultCellCol=vec3(.2),DefaultRingCol=vec3(0.,.2,.2),DiskCol=vec3(0.);
+const vec3 DefaultEdge=vec3(.6,.85,1.);
+
+// Outer pulse: light desaturated organic brown/yellow/orange
+const vec3 ppWarm = vec3(0.88, 0.75, 0.55);
+const vec3 ppCool = vec3(0.70, 0.62, 0.48);
+
+const vec3 bg=vec3(.84,.84,.82);
+
+void main(){
+  vec2 fc=uv*uRes, ctr=vec2(uRes)*.5;
+  float dist=length(fc-ctr), vR=uRes*.5-2.;
+  ivec2 ifc=ivec2(fc);
+  vec4 a=texelFetch(uA,ifc,0);
+  ivec2 ifc2=ivec2(mod(vec2(ifc)+vec2(0.5),vec2(uRes)));
+  float a_y2=texelFetch(uA,ifc2,0).y;
+  vec4 bv=texelFetch(uB,ifc,0);
+  vec4 cv=texelFetch(uC,ifc,0);
+  vec4 rc=texelFetch(uCol,ifc,0);   // per-organism cell color (dominant base)
+  vec4 pc=texelFetch(uPulse,ifc,0); // per-organism inner pulse color
+  vec4 rk=texelFetch(uRing,ifc,0);  // per-organism ring color (secondary base)
+
+  // Per-organism cell and ring colors — bright like iteration 3
+  vec3 CellCol = mix(DefaultCellCol, rc.rgb, rc.a);
+  vec3 RingCol = mix(DefaultRingCol, rk.rgb, rk.a);
+
+  // Edge highlight color: blend of both organism colors, brightened
+  float orgA = max(rc.a, rk.a);
+  vec3 edgeCol = mix(DefaultEdge, (rc.rgb + rk.rgb) * 2.5 + vec3(0.2), orgA);
+
+  // Base PulseLife cell color (same structure as iteration 3)
+  vec3 color = a.x * CellCol + a.y * RingCol + a.z * DiskCol;
+  float c1=1.-a.z, c2=1.-a_y2;
+  color += edgeCol * max(c2*c2 - c1*c1, 0.0) * 4.0;
+
+  // Outer wave: organic brown/amber (moderate)
+  vec3 waves=(1.-a.x)*bv.xyz;
+  vec3 w=vec3(.22,.38,.38)*abs(waves);
+  vec3 wcol = w.x * ppWarm * 1.0 + w.y * ppCool * 0.9 + w.z * (ppWarm + ppCool) * 0.4;
+
+  // Tint outer waves subtly with organism colors
+  if(orgA > 0.01){
+    vec3 orgTint = (CellCol + RingCol) * 1.5;
+    wcol = mix(wcol, wcol * (0.6 + orgTint * 0.8), orgA * 0.35);
+  }
+
+  // Inner pulse: per-organism RNA base-pair colors
+  float pulseA=pc.a;
+  vec3 pulseBlend = pc.rgb;
+  vec3 pulseBlend2 = pulseBlend * 0.6 + vec3(0.15);
+
+  float pulseVal=cv.x;
+  vec3 pcol;
+  if(pulseA > 0.01){
+    vec3 posPulse = pulseBlend * 1.2 + vec3(0.06);
+    vec3 negPulse = pulseBlend2 * 0.8 + vec3(0.04);
+    float pw=0.8;
+    pcol = (smoothstep(-pw,pw,pulseVal)*posPulse + smoothstep(pw,-pw,pulseVal)*negPulse) * color.b;
+  } else {
+    vec3 neutral = vec3(0.4, 0.4, 0.35);
+    float pw=0.8;
+    pcol = (smoothstep(-pw,pw,pulseVal)*neutral + smoothstep(pw,-pw,pulseVal)*neutral*0.6) * color.b;
+  }
+
+  vec3 lifeC = 0.4 * color + wcol + pcol;
+
+  // RNA stain overlay
+  if(orgA > 0.005){
+    vec3 stain = (CellCol + RingCol) * 2.0;
+    float lv = smoothstep(.03,.25,a.x);
+    vec3 stained = lifeC * 0.25 + stain * 0.9;
+    stained += wcol * stain * 0.6 + pcol * stain * 0.4;
+    lifeC = mix(lifeC, stained, orgA * lv);
+  }
+
+  // Microscope field
+  float field=smoothstep(.015,.12, a.x+length(wcol)*.3+abs(cv.x)*.15);
+  vec3 fin=mix(bg,lifeC,field);
+
+  float grain=fract(sin(dot(fc,vec2(12.9898,78.233)))*43758.5453);
+  fin+=(grain-.5)*.012;
+  fin*=1.-pow(dist/vR,4.)*.18;
+  float edge=smoothstep(vR+2.,vR-18.,dist);
+  fin=mix(vec3(0),fin,edge);
+  O=vec4(fin,1.);
+}`;
+
+// ===================== Compile =====================
+const pA = linkProg(VS, FS_A, 'BufA');
+const pB = linkProg(VS, FS_B, 'BufB');
+const pC = linkProg(VS, FS_C, 'BufC');
+const pI = linkProg(VS, FS_IMG, 'Image');
+if (!pA||!pB||!pC||!pI) {
+  document.body.innerHTML='<p style="color:#f44;padding:40vh 2em;text-align:center">Shader compilation failed. Check console.</p>';
+  throw 'shader fail';
+}
+const u=(p,n)=>gl.getUniformLocation(p,n);
+
+// ===================== RNA Processing =====================
+const BV={
+  A:[[8,110,180],[15,140,155],[5,100,145],[20,130,170],[12,118,190]],
+  U:[[180,160,35],[155,140,50],[190,170,30],[165,148,55],[175,155,42]],
+  G:[[30,170,10],[45,145,15],[35,162,5],[50,140,20],[28,150,12]],
+  C:[[180,50,35],[160,68,50],[185,45,42],[155,72,48],[175,55,32]]
+};
+function canPair(a,b){return'AU UA GC CG GU UG'.includes(a+b);}
+function foldRNA(seq){
+  const n=seq.length;if(n<4)return{pairs:[],score:0};
+  const dp=Array.from({length:n},()=>new Int32Array(n));
+  for(let len=4;len<=n;len++)for(let i=0;i<=n-len;i++){const j=i+len-1;dp[i][j]=dp[i][j-1];
+    for(let k=i;k<j-2;k++)if(canPair(seq[k],seq[j])){let v=(k>i?dp[i][k-1]:0)+1+(k+1<=j-1?dp[k+1][j-1]:0);dp[i][j]=Math.max(dp[i][j],v);}}
+  const pairs=[];
+  (function tb(i,j){if(i>=j)return;if(dp[i][j]===dp[i][j-1]){tb(i,j-1);return;}
+    for(let k=i;k<j-2;k++)if(canPair(seq[k],seq[j])){let v=(k>i?dp[i][k-1]:0)+1+(k+1<=j-1?dp[k+1][j-1]:0);
+      if(v===dp[i][j]){pairs.push([k,j]);if(k>i)tb(i,k-1);tb(k+1,j-1);return;}}})(0,n-1);
+  return{pairs,score:dp[0][n-1]};
+}
+function hashSeq(s){let h=0;for(let i=0;i<s.length;i++)h=((h<<5)-h+s.charCodeAt(i))|0;return h;}
+function srng(seed){let s=Math.abs(seed)||1;return()=>{s=(s*1103515245+12345)&0x7fffffff;return s/0x7fffffff;};}
+
+// Bright cell colors from dominant base (like iteration 3's CellCol=vec3(.2) but tinted)
+const CELL_COLORS = {
+  A: [0.12, 0.18, 0.24],  // blue-tinted gray
+  U: [0.24, 0.22, 0.12],  // warm golden gray
+  G: [0.14, 0.22, 0.12],  // green-tinted gray
+  C: [0.24, 0.14, 0.12],  // red-tinted gray
+};
+// Vivid ring colors from secondary base (like iteration 3's RingCol=vec3(0,.2,.2) but varied)
+const RING_COLORS = {
+  A: [0.0, 0.12, 0.22],   // deep blue (like teal but blue-shifted)
+  U: [0.22, 0.18, 0.0],   // deep gold
+  G: [0.0, 0.20, 0.08],   // deep green
+  C: [0.22, 0.06, 0.04],  // deep red
+};
+
+function deriveProps(seq){
+  const n=seq.length,fold=foldRNA(seq),h=hashSeq(seq),R=srng(h);
+  let ct={A:0,U:0,G:0,C:0};for(const c of seq)ct[c]=(ct[c]||0)+1;
+  const gc=(ct.G+ct.C)/n, au=(ct.A+ct.U)/n;
+  const compact=fold.pairs.length/Math.max(1,n/2);
+  const stab=Math.min(1,.3+.7*(gc*.6+(fold.score/(n/2))*.4));
+  const size=Math.max(5,Math.min(18,5+n*.35-compact*3));
+  const elong=1-compact*.7;
+  const sorted=Object.entries(ct).sort((a,b)=>b[1]-a[1]);
+  const dom=sorted[0][0], sec=(sorted[1]||sorted[0])[0];
+  const v1=BV[dom][Math.abs(h)%5].map(x=>x/255);
+  const v2=BV[sec][Math.abs(h>>3)%5].map(x=>x/255);
+  const m=.3+R()*.4;
+  // Cell color from dominant base, ring color from secondary base
+  const cellCol = CELL_COLORS[dom];
+  const ringCol = RING_COLORS[sec];
+  return{seq,fold,stab,size,repl:Math.min(1,.2+.8*au*(1-compact*.3)),elong,
+    color:[v1[0]*(1-m)+v2[0]*m,v1[1]*(1-m)+v2[1]*m,v1[2]*(1-m)+v2[2]*m],
+    baseFrac:[ct.A/n, ct.U/n, ct.G/n, ct.C/n],
+    cellCol, ringCol,
+    dom,sec,compact,R};
+}
+
+// Desaturated base-pair colors for inner pulse (must match shader constants)
+const PULSE_COLORS = {
+  A: [0.25, 0.42, 0.58],  // blue
+  U: [0.58, 0.54, 0.28],  // yellow
+  G: [0.28, 0.52, 0.22],  // green
+  C: [0.58, 0.28, 0.25],  // red
+};
+
+function computePulseColor(baseFrac) {
+  // baseFrac = [A, U, G, C] fractions
+  return [
+    baseFrac[0]*PULSE_COLORS.A[0] + baseFrac[1]*PULSE_COLORS.U[0] + baseFrac[2]*PULSE_COLORS.G[0] + baseFrac[3]*PULSE_COLORS.C[0],
+    baseFrac[0]*PULSE_COLORS.A[1] + baseFrac[1]*PULSE_COLORS.U[1] + baseFrac[2]*PULSE_COLORS.G[1] + baseFrac[3]*PULSE_COLORS.C[1],
+    baseFrac[0]*PULSE_COLORS.A[2] + baseFrac[1]*PULSE_COLORS.U[2] + baseFrac[2]*PULSE_COLORS.G[2] + baseFrac[3]*PULSE_COLORS.C[2],
+  ];
+}
+
+function stampOrganism(props){
+  const ang=Math.random()*Math.PI*2;
+  const maxR=SIM/2-props.size-15;
+  const d=Math.random()*maxR*.8;
+  const cx=Math.round(SIM/2+Math.cos(ang)*d);
+  const cy=Math.round(SIM/2+Math.sin(ang)*d);
+  const r=Math.ceil(props.size);
+  const lobes=2+Math.floor(props.fold.pairs.length/3);
+  const amp=props.elong*.35;
+  const pc = computePulseColor(props.baseFrac);
+  const cc = props.cellCol;
+  const rc = props.ringCol;
+  for(let dy=-r;dy<=r;dy++)for(let dx=-r;dx<=r;dx++){
+    const sx=((cx+dx)%SIM+SIM)%SIM, sy=((cy+dy)%SIM+SIM)%SIM;
+    const ndx=dx/r, ndy=dy/(r*(1+props.elong*.5));
+    const dist=Math.sqrt(ndx*ndx+ndy*ndy);
+    const a=Math.atan2(ndy,ndx);
+    const rmod=1+amp*Math.sin(a*lobes+props.fold.score)+.12*Math.sin(a*(lobes+2)+1.7);
+    if(dist<rmod){
+      const edge=Math.max(0,1-dist*dist/(rmod*rmod));
+      const idx=(sy*SIM+sx)*4;
+      const inRing=(dist>.25&&dist<.85)?1:0;
+      stampBuf[idx]=Math.max(stampBuf[idx],inRing*edge);
+      const cs=edge*(.4+.6*(dist>.2?1:.3));
+      // Cell color from dominant base
+      colorBuf[idx]=Math.max(colorBuf[idx],cc[0]*cs);
+      colorBuf[idx+1]=Math.max(colorBuf[idx+1],cc[1]*cs);
+      colorBuf[idx+2]=Math.max(colorBuf[idx+2],cc[2]*cs);
+      colorBuf[idx+3]=Math.max(colorBuf[idx+3],cs);
+      // Ring color from secondary base
+      ringBuf[idx]=Math.max(ringBuf[idx],rc[0]*cs);
+      ringBuf[idx+1]=Math.max(ringBuf[idx+1],rc[1]*cs);
+      ringBuf[idx+2]=Math.max(ringBuf[idx+2],rc[2]*cs);
+      ringBuf[idx+3]=Math.max(ringBuf[idx+3],cs);
+      // Per-organism pulse color
+      pulseBuf[idx]=Math.max(pulseBuf[idx],pc[0]*cs);
+      pulseBuf[idx+1]=Math.max(pulseBuf[idx+1],pc[1]*cs);
+      pulseBuf[idx+2]=Math.max(pulseBuf[idx+2],pc[2]*cs);
+      pulseBuf[idx+3]=Math.max(pulseBuf[idx+3],cs);
+    }
+  }
+}
+
+function uploadTex(tex, data){
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,SIM,SIM,gl.RGBA,gl.FLOAT,data);
+}
+function fadeStamps(){
+  for(let i=0;i<stampBuf.length;i+=4){stampBuf[i]*=.88;if(stampBuf[i]<.001)stampBuf[i]=0;}
+  for(let i=0;i<colorBuf.length;i+=4){
+    colorBuf[i]*=.9997;colorBuf[i+1]*=.9997;colorBuf[i+2]*=.9997;colorBuf[i+3]*=.9997;
+  }
+  for(let i=0;i<pulseBuf.length;i+=4){
+    pulseBuf[i]*=.9997;pulseBuf[i+1]*=.9997;pulseBuf[i+2]*=.9997;pulseBuf[i+3]*=.9997;
+  }
+  for(let i=0;i<ringBuf.length;i+=4){
+    ringBuf[i]*=.9997;ringBuf[i+1]*=.9997;ringBuf[i+2]*=.9997;ringBuf[i+3]*=.9997;
+  }
+}
+
+// ===================== Full Reset =====================
+function clearAllBuffers(){
+  const blank = new Float32Array(SIM*SIM*4);
+  // Clear ping-pong FBOs
+  [A,B,C].forEach(buf=>{
+    [buf.r, buf.w].forEach(side=>{
+      gl.bindTexture(gl.TEXTURE_2D, side.tex);
+      gl.texSubImage2D(gl.TEXTURE_2D,0,0,0,SIM,SIM,gl.RGBA,gl.FLOAT,blank);
+    });
+  });
+  // Clear stamp + color
+  stampBuf.fill(0);
+  colorBuf.fill(0);
+  pulseBuf.fill(0);
+  ringBuf.fill(0);
+  uploadTex(stampTex, stampBuf);
+  uploadTex(colorTex, colorBuf);
+  uploadTex(pulseTex, pulseBuf);
+  uploadTex(ringTex, ringBuf);
+  frame = 0;
+}
+
+function resetWithDefault(){
+  clearAllBuffers();
+  pending.push(deriveProps(DEFAULT_SEQ));
+  // Show default in input as display text
+  lastDisplaySeq = DEFAULT_SEQ;
+  showDisplaySeq();
+}
+
+// ===================== Render Loop =====================
+let frame=0, pending=[];
+
+function bindTex(unit, tex){
+  gl.activeTexture(gl.TEXTURE0+unit);
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+}
+
+function tick(){
+  if(pending.length){
+    for(const p of pending) {
+      stampOrganism(p);
+    }
+    pending.length=0;
+    uploadTex(stampTex, stampBuf);
+    uploadTex(colorTex, colorBuf);
+    uploadTex(pulseTex, pulseBuf);
+    uploadTex(ringTex, ringBuf);
+  }
+  if(frame%4===0){ fadeStamps(); uploadTex(stampTex,stampBuf); uploadTex(colorTex,colorBuf); uploadTex(pulseTex,pulseBuf); uploadTex(ringTex,ringBuf); }
+
+  gl.viewport(0,0,SIM,SIM);
+
+  // Buffer A
+  gl.bindFramebuffer(gl.FRAMEBUFFER, A.w.fbo);
+  gl.useProgram(pA);
+  bindTex(0, A.r.tex); gl.uniform1i(u(pA,'uSelf'),0);
+  bindTex(1, stampTex); gl.uniform1i(u(pA,'uStamp'),1);
+  gl.uniform1f(u(pA,'uRes'), SIM);
+  gl.uniform1i(u(pA,'uFrame'), frame);
+  quad(); A.swap();
+
+  // Buffer B
+  gl.bindFramebuffer(gl.FRAMEBUFFER, B.w.fbo);
+  gl.useProgram(pB);
+  bindTex(0, B.r.tex); gl.uniform1i(u(pB,'uSelf'),0);
+  bindTex(1, A.r.tex); gl.uniform1i(u(pB,'uLife'),1);
+  gl.uniform1f(u(pB,'uRes'), SIM);
+  quad(); B.swap();
+
+  // Buffer C
+  gl.bindFramebuffer(gl.FRAMEBUFFER, C.w.fbo);
+  gl.useProgram(pC);
+  bindTex(0, C.r.tex); gl.uniform1i(u(pC,'uSelf'),0);
+  bindTex(1, A.r.tex); gl.uniform1i(u(pC,'uLife'),1);
+  gl.uniform1f(u(pC,'uRes'), SIM);
+  quad(); C.swap();
+
+  // Image
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0,0,canvas.width,canvas.height);
+  gl.useProgram(pI);
+  bindTex(0, A.r.tex); gl.uniform1i(u(pI,'uA'),0);
+  bindTex(1, B.r.tex); gl.uniform1i(u(pI,'uB'),1);
+  bindTex(2, C.r.tex); gl.uniform1i(u(pI,'uC'),2);
+  bindTex(3, colorTex); gl.uniform1i(u(pI,'uCol'),3);
+  bindTex(4, pulseTex); gl.uniform1i(u(pI,'uPulse'),4);
+  bindTex(5, ringTex);  gl.uniform1i(u(pI,'uRing'),5);
+  gl.uniform1f(u(pI,'uRes'), SIM);
+  quad();
+
+  frame++;
+  requestAnimationFrame(tick);
+}
+
+// ===================== Input with display/clear-on-type =====================
+const rnaInput = document.getElementById('rna-input');
+const coloredOverlay = document.getElementById('colored-overlay');
+const IC = {A:'#2cb8e0', U:'#d4c844', G:'#4cdb2a', C:'#e05a44'};
+
+let lastDisplaySeq = DEFAULT_SEQ; // sequence shown as ghost text
+let isDisplayMode = true;         // true = showing last sequence (will clear on type)
+
+function renderColoredText(text, dimmed){
+  if(dimmed){
+    // Gray dimmed display of last sequence
+    return [...text].map(ch =>
+      `<span style="color:#888;opacity:0.5">${ch}</span>`
+    ).join('');
+  }
+  return [...text].map(ch => {
+    const c = IC[ch];
+    return c ? `<span style="color:${c}">${ch}</span>`
+             : `<span style="color:#555">${ch}</span>`;
+  }).join('');
+}
+
+function showDisplaySeq(){
+  coloredOverlay.innerHTML = renderColoredText(lastDisplaySeq, true);
+  rnaInput.value = '';
+  isDisplayMode = true;
+}
+
+function updateOverlay(){
+  const val = rnaInput.value.toUpperCase();
+  if(val.length > 0){
+    coloredOverlay.innerHTML = renderColoredText(val, false);
+  } else {
+    // Show ghost of last sequence
+    showDisplaySeq();
+  }
+}
+
+// Macropad remapping: 1=A, 2=U, 3=C, 4=G, 5=Enter
+const MACROPAD_MAP = {'1':'A','2':'U','3':'C','4':'G'};
+
+// Clear on first keypress if in display mode
+rnaInput.addEventListener('keydown', e => {
+  // Macropad: remap number keys
+  if(e.key === '5'){
+    e.preventDefault();
+    // Simulate Enter
+    const raw = rnaInput.value.toUpperCase().replace(/[^AUGC]/g,'');
+    if(raw.length < 3) return;
+    const seq = raw.slice(0, 50);
+    pending.push(deriveProps(seq));
+    lastDisplaySeq = seq;
+    showDisplaySeq();
+    isDisplayMode = true;
+    resetIdleTimer();
+    return;
+  }
+  if(MACROPAD_MAP[e.key]){
+    e.preventDefault();
+    const base = MACROPAD_MAP[e.key];
+    // Clear display text on first keystroke
+    if(isDisplayMode){
+      rnaInput.value = '';
+      coloredOverlay.innerHTML = '';
+      isDisplayMode = false;
+    }
+    // Insert the mapped base at cursor position
+    const start = rnaInput.selectionStart;
+    const end = rnaInput.selectionEnd;
+    const val = rnaInput.value;
+    if(val.length < 50){
+      rnaInput.value = val.slice(0,start) + base + val.slice(end);
+      rnaInput.selectionStart = rnaInput.selectionEnd = start + 1;
+    }
+    updateOverlay();
+    resetIdleTimer();
+    return;
+  }
+
+  if(e.key === 'Enter'){
+    e.preventDefault();
+    const raw = rnaInput.value.toUpperCase().replace(/[^AUGC]/g,'');
+    if(raw.length < 3) return;
+    const seq = raw.slice(0, 50);
+    pending.push(deriveProps(seq));
+    lastDisplaySeq = seq;
+    showDisplaySeq();
+    isDisplayMode = true;
+    resetIdleTimer();
+    return;
+  }
+  // If in display mode and user types a character, clear first
+  if(isDisplayMode && e.key.length === 1 && !e.ctrlKey && !e.metaKey){
+    rnaInput.value = '';
+    coloredOverlay.innerHTML = '';
+    isDisplayMode = false;
+  }
+  resetIdleTimer();
+});
+
+rnaInput.addEventListener('input', () => {
+  const pos = rnaInput.selectionStart;
+  const f = rnaInput.value.toUpperCase().replace(/[^AUGC]/g,'');
+  if(f !== rnaInput.value){
+    rnaInput.value = f;
+    rnaInput.selectionStart = rnaInput.selectionEnd = Math.min(pos, f.length);
+  }
+  if(f.length > 0) isDisplayMode = false;
+  updateOverlay();
+  resetIdleTimer();
+});
+
+// Keep focus on input at all times
+rnaInput.focus();
+document.addEventListener('click', () => { rnaInput.focus(); });
+document.addEventListener('keydown', e => {
+  if(document.activeElement !== rnaInput && !e.ctrlKey && !e.metaKey){
+    rnaInput.focus();
+  }
+});
+// Re-focus if somehow lost
+setInterval(() => { if(document.activeElement !== rnaInput) rnaInput.focus(); }, 500);
+
+// ===================== 30-second idle reset =====================
+let idleTimer = null;
+const IDLE_TIMEOUT = 30000; // 30 seconds
+
+function resetIdleTimer(){
+  if(idleTimer) clearTimeout(idleTimer);
+  idleTimer = setTimeout(() => {
+    resetWithDefault();
+  }, IDLE_TIMEOUT);
+}
+
+// ===================== Initialize =====================
+// Show default sequence and seed it
+showDisplaySeq();
+pending.push(deriveProps(DEFAULT_SEQ));
+resetIdleTimer();
+
+tick();
+rnaInput.focus();
+</script>
+</body>
+</html>
